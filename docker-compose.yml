@@ -3,11 +3,15 @@
 #
 # PUBLIC_PORT=7000:7000
 # REPLICAS_COUNT=1
+# REMBG_IDLE_TIMEOUT=300   (seconds without requests before models are unloaded, 0 = never)
 
 services:
   app:
     build: .
     command: ["s"]
+    restart: unless-stopped
+    environment:
+      - REMBG_IDLE_TIMEOUT=${REMBG_IDLE_TIMEOUT:-300}
     deploy:
       replicas: ${REPLICAS_COUNT:-1}
     ports:

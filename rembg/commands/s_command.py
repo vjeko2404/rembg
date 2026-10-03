@@ -1,8 +1,13 @@
+import ctypes
+import gc
 import ipaddress
 import json
 import os
 import socket
+import threading
+import time
 import webbrowser
+from contextlib import contextmanager
 from typing import List, Optional, Tuple, Union, cast
 from urllib.parse import urljoin, urlparse
 
@@ -14,7 +19,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
-from .. import __version__
+from .. import __version__, matting
 from ..bg import remove
 from ..session_factory import new_session
 from ..sessions import sessions_names
@@ -71,6 +76,19 @@ def _unwrap_ipv6(
         return ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
 
     return ip
+
+
+def _release_freed_memory() -> None:
+    """Hand freed heap pages back to the OS.
+
+    Dropping an onnxruntime session frees its arena, but glibc keeps the
+    pages mapped to the process, so RSS barely moves without an explicit trim.
+    No-op on non-glibc platforms.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def _is_blocked_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
@@ -134,7 +152,22 @@ def _is_blocked_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> b
     show_default=True,
     help="disable the Gradio UI (reduces idle CPU usage)",
 )
-def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -> None:
+@click.option(
+    "--idle-timeout",
+    default=0,
+    type=click.IntRange(min=0),
+    show_default=True,
+    envvar="REMBG_IDLE_TIMEOUT",
+    help="unload models after this many seconds without requests (0 = never)",
+)
+def s_command(
+    port: int,
+    host: str,
+    log_level: str,
+    threads: int,
+    no_ui: bool,
+    idle_timeout: int,
+) -> None:
     """
     Command-line interface for running the FastAPI web server.
 
@@ -142,6 +175,51 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
     If the number of worker threads is specified, it sets the thread limiter accordingly.
     """
     sessions: dict[tuple, BaseSession] = {}
+    # Guards `sessions`, `active_requests` and `last_used` so the idle watcher
+    # never unloads a model while a request is using it.
+    sessions_lock = threading.Lock()
+    active_requests = 0
+    last_used = time.monotonic()
+
+    @contextmanager
+    def use_session(model: str, extras: dict, **kwargs):
+        nonlocal active_requests, last_used
+
+        # Extras are part of the key: a session built with one caller's api_key
+        # or model_path must not be handed to a request that passed another.
+        cache_key = (model, json.dumps(extras, sort_keys=True, default=str))
+        with sessions_lock:
+            session = sessions.get(cache_key)
+            if session is None:
+                session = new_session(model, **kwargs)
+                sessions[cache_key] = session
+            active_requests += 1
+
+        try:
+            yield session
+        finally:
+            with sessions_lock:
+                active_requests -= 1
+                last_used = time.monotonic()
+
+    def unload_idle_models() -> None:
+        while True:
+            time.sleep(min(idle_timeout, 30))
+            with sessions_lock:
+                if active_requests or not (sessions or matting._sessions):
+                    continue
+                if time.monotonic() - last_used < idle_timeout:
+                    continue
+                count = len(sessions) + len(matting._sessions)
+                sessions.clear()
+                matting._sessions.clear()
+
+            gc.collect()
+            _release_freed_memory()
+            print(
+                f"Unloaded {count} model(s) after {idle_timeout}s idle", flush=True
+            )
+
     tags_metadata = [
         {
             "name": "Background Removal",
@@ -284,31 +362,24 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             except Exception:
                 pass
 
-        # Extras are part of the key: a session built with one caller's api_key
-        # or model_path must not be handed to a request that passed another.
-        cache_key = (commons.model, json.dumps(kwargs, sort_keys=True, default=str))
-        session = sessions.get(cache_key)
-        if session is None:
-            session = new_session(commons.model, **kwargs)
-            sessions[cache_key] = session
-
-        return Response(
-            remove(
-                content,
-                session=session,
-                alpha_matting=commons.a,
-                alpha_matting_foreground_threshold=commons.af,
-                alpha_matting_background_threshold=commons.ab,
-                alpha_matting_erode_size=commons.ae,
-                only_mask=commons.om,
-                post_process_mask=commons.ppm,
-                decontaminate=commons.dc,
-                vitmatte=commons.vm,
-                bgcolor=commons.bgc,
-                **kwargs,
-            ),
-            media_type="image/png",
-        )
+        with use_session(commons.model, kwargs, **kwargs) as session:
+            return Response(
+                remove(
+                    content,
+                    session=session,
+                    alpha_matting=commons.a,
+                    alpha_matting_foreground_threshold=commons.af,
+                    alpha_matting_background_threshold=commons.ab,
+                    alpha_matting_erode_size=commons.ae,
+                    only_mask=commons.om,
+                    post_process_mask=commons.ppm,
+                    decontaminate=commons.dc,
+                    vitmatte=commons.vm,
+                    bgcolor=commons.bgc,
+                    **kwargs,
+                ),
+                media_type="image/png",
+            )
 
     @app.on_event("startup")
     def startup():
@@ -322,6 +393,11 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             from anyio.lowlevel import RunVar
 
             RunVar("_default_thread_limiter").set(CapacityLimiter(threads))
+
+        if idle_timeout > 0:
+            threading.Thread(
+                target=unload_idle_models, name="rembg-idle-unload", daemon=True
+            ).start()
 
     def _resolve_public_ips(host: str) -> list[str]:
         """Resolve a hostname to IPs, rejecting the request if any resolved
@@ -479,16 +555,8 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
                 extras = json.loads(cmd_args)
                 kwargs.update(extras)
 
-            # Extras are part of the key: a session built with one api_key or
-            # model_path must not be reused for a request that passed another.
-            cache_key = (model, json.dumps(extras, sort_keys=True, default=str))
-            session = sessions.get(cache_key)
-            if session is None:
-                session = new_session(model, **kwargs)
-                sessions[cache_key] = session
-            kwargs["session"] = session
-
-            return remove(input_image, **kwargs)
+            with use_session(model, extras, **kwargs) as session:
+                return remove(input_image, session=session, **kwargs)
 
         interface = gr.Interface(
             inference,
